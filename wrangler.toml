@@ -6,7 +6,7 @@
 #
 # The native binary / Docker image (the published `noveum-ai-gateway` crate) is
 # unaffected by this file — it is a separate deployment shape of the same package.
-name = "noveum-ai-gateway"
+name = "ujs-ai-gateway"
 # Preview URLs are intentionally disabled. Deleted preview versions can remain
 # routable at Cloudflare's edge even after the Versions API returns 404; keep
 # this service's version-prefix and alias hosts dark unless a bounded preview
