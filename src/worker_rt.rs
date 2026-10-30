@@ -820,6 +820,10 @@ fn stream_passthrough(
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // Diagnostics bypass provider routing, policy state and permissive CORS.
+    if req.path() == crate::worker_egress::PATH {
+        return crate::worker_egress::handle(req, env).await;
+    }
     // CORS preflight — mirror the native permissive CorsLayer.
     if req.method() == Method::Options {
         return Ok(apply_cors(Response::empty()?.with_status(204)));
