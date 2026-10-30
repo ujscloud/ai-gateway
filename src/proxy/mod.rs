@@ -476,3 +476,184 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod transport_regressions {
+    use super::*;
+    use crate::providers::OpenAIProvider;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    fn config() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            port: 3000,
+            host: "127.0.0.1".into(),
+            worker_threads: 1,
+            max_connections: 1,
+        })
+    }
+
+    async fn send(url: String, content_type: &str, body: Vec<u8>) -> Response<Body> {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", content_type.parse().unwrap());
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer mock-only"),
+        );
+        let provider: Box<dyn Provider> = Box::new(OpenAIProvider::default());
+        // Exercise the real pooled HTTP client and response adapter; the only
+        // destination is the test's loopback listener, never a provider API.
+        send_provider_request(Method::POST, url, headers, body.into(), &provider, config())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_round_trip(content_type: &str, request_body: Vec<u8>) {
+        let upstream = MockServer::start().await;
+        let response_body = br#"{"id":"mock","text":"unchanged"}"#;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_raw(response_body, "application/json"),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let response = send(
+            format!("{}/v1/fixture?mode=exact", upstream.uri()),
+            content_type,
+            request_body.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            response_body
+        );
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/v1/fixture");
+        assert_eq!(received[0].url.query(), Some("mode=exact"));
+        assert_eq!(received[0].headers["content-type"], content_type);
+        assert_eq!(received[0].headers["authorization"], "Bearer mock-only");
+        assert_eq!(received[0].body, request_body);
+    }
+
+    #[tokio::test]
+    async fn json_transport_keeps_body_headers_query_and_response() {
+        assert_round_trip(
+            "application/json",
+            br#"{"model":"mock","input":"hello","stream":false}"#.to_vec(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_transport_keeps_boundary_and_binary_file_bytes() {
+        let mut body = b"--fixture\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        body.extend_from_slice(&[0, 255, 128, 13, 10]);
+        body.extend_from_slice(b"\r\n--fixture--\r\n");
+        assert_round_trip("multipart/form-data; boundary=fixture", body).await;
+    }
+
+    #[tokio::test]
+    async fn brotli_json_response_is_decoded_by_the_real_transport_client() {
+        let expected = format!(
+            "{{\"text\":\"{}\"}}",
+            "mock compressed content ".repeat(128)
+        );
+        let payload = expected.clone();
+        let app = axum::Router::new()
+            .route(
+                "/compressed",
+                axum::routing::post(move || {
+                    let payload = payload.clone();
+                    async move { ([("content-type", "application/json")], payload) }
+                }),
+            )
+            .layer(tower_http::compression::CompressionLayer::new())
+            .layer(axum::middleware::map_response(
+                |response: Response<Body>| async move {
+                    assert_eq!(
+                        response.headers()["content-encoding"],
+                        "br",
+                        "fixture must actually compress"
+                    );
+                    response
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = send(
+            format!("http://{address}/compressed"),
+            "application/json",
+            b"{}".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("content-encoding").is_none());
+        assert_eq!(
+            to_bytes(response.into_body(), 8192).await.unwrap().as_ref(),
+            expected.as_bytes()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_transport_delivers_first_chunk_before_upstream_finishes() {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let first = Bytes::from_static(b"data: {\"delta\":\"hello\"}\n\n");
+        sender.send(Ok(first.clone())).await.unwrap();
+        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let app = axum::Router::new().route(
+            "/events",
+            axum::routing::post(move || {
+                let receiver = receiver.clone();
+                async move {
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(
+                        receiver.lock().await.take().unwrap(),
+                    );
+                    Response::builder()
+                        .header("content-type", "text/event-stream; charset=utf-8")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                format!("http://{address}/events"),
+                "application/json",
+                br#"{"stream":true}"#.to_vec(),
+            ),
+        )
+        .await
+        .expect("headers must not wait for stream EOF");
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.headers().get_all("content-type").iter().count(), 1);
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("first event must arrive while upstream is still open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.into_data().unwrap(), first);
+        sender
+            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .await
+            .unwrap();
+        drop(sender);
+        let rest = tokio::time::timeout(Duration::from_secs(2), to_bytes(body, 1024))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest.as_ref(), b"data: [DONE]\n\n");
+        server.abort();
+    }
+}

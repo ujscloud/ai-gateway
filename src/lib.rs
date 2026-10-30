@@ -56,6 +56,8 @@ pub mod telemetry;
 // Cloudflare Worker runtime (WASM): the `#[event(fetch)]` entry point + edge
 // proxy. Only compiled for wasm32.
 #[cfg(target_arch = "wasm32")]
+mod worker_egress;
+#[cfg(target_arch = "wasm32")]
 pub mod worker_rt;
 
 #[cfg(not(target_arch = "wasm32"))]
